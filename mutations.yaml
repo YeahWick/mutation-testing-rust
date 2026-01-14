@@ -1,0 +1,35 @@
+# Example mutations.yaml configuration file
+# This file defines mutations to test against your codebase
+
+version: "1.0"
+
+settings:
+  timeout: 30  # seconds per test run
+
+mutations:
+  # Example mutations - replace these with mutations for your project!
+  #
+  # Each mutation specifies:
+  #   - file: path to the Rust source file
+  #   - function: name of the function containing the code
+  #   - original: the expression to find (must be valid Rust)
+  #   - replacement: the expression to replace it with
+  #
+  # Arithmetic operator mutations
+  # - file: src/math.rs
+  #   function: add
+  #   original: a + b
+  #   replacement: a - b
+  #
+  # Comparison operator mutations (good for boundary testing)
+  # - file: src/validator.rs
+  #   function: is_adult
+  #   original: age >= 18
+  #   replacement: age > 18
+  #
+  # Logical operator mutations
+  # - file: src/auth.rs
+  #   function: check_access
+  #   original: is_admin && is_active
+  #   replacement: is_admin || is_active
+  []

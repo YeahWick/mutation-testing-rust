@@ -1,0 +1,33 @@
+[package]
+name = "mutation-testing-rust"
+version = "0.1.0"
+edition = "2021"
+description = "AST-based mutation testing framework for Rust"
+license = "MIT"
+
+[dependencies]
+# AST parsing
+syn = { version = "2.0", features = ["full", "visit", "visit-mut", "parsing", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+
+# Code formatting
+prettyplease = "0.2"
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+tempfile = "3.0"
+colored = "2.0"
+
+[dev-dependencies]
+pretty_assertions = "1.0"
