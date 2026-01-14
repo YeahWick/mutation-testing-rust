@@ -29,16 +29,19 @@
 
 ## Executive Summary
 
-This specification defines an AST-based mutation testing engine for Rust using **manual mutation definitions**. Users specify mutations in a human-readable YAML configuration file by providing:
+This specification defines an AST-based mutation testing engine for Rust using **manual mutation definitions**. Users specify mutations in a simple YAML configuration:
 
-- The target file and function
-- A description of the mutation
-- The **replacement code** (what the code should become)
+```yaml
+- file: src/math.rs
+  function: add
+  original: a + b
+  replacement: a - b
+```
 
-The engine parses the replacement code as an AST expression and searches for matching original expressions within the target function. This approach provides:
+The engine uses AST parsing (not text matching) to find and replace expressions, providing:
 
-- **Human-readable configs**: Just write what you want the code to become
-- **AST precision**: Mutations match syntax structure, not text patterns
+- **Human-readable configs**: Clear "original → replacement" format
+- **AST precision**: Matches syntax structure, not text patterns
 - **Clear error reporting**: Detailed feedback when mutations don't match
 
 ---
@@ -49,12 +52,12 @@ The engine parses the replacement code as an AST expression and searches for mat
 
 ```
 ┌─────────────────┐
-│ mutations.yaml  │  User specifies: file, function, replacement code
+│ mutations.yaml  │  User specifies: file, function, original, replacement
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  Parse Config   │  Parse replacement code as AST expression
+│  Parse Config   │  Parse original and replacement as AST expressions
 └────────┬────────┘
          │
          ▼
@@ -69,24 +72,26 @@ The engine parses the replacement code as an AST expression and searches for mat
          │
          ▼
 ┌─────────────────┐
-│ Match Original  │  Find expression that replacement would replace
-└────────┬────────┘  (infer original from replacement structure)
+│  Match Original │  Find AST node matching original expression
+└────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│ Apply Mutation  │  Replace original with mutant, run tests
+│ Apply Mutation  │  Replace with mutant, run tests
 └─────────────────┘
 ```
 
-### Key Insight: Inferring Original from Replacement
+### Why AST-Based Matching?
 
-When a user specifies `a - b` as a replacement:
-1. Parse `a - b` as an AST: `ExprBinary { left: a, op: Sub, right: b }`
-2. The **structure** tells us what to look for: a binary expression with left=`a`, right=`b`
-3. Search the function for any binary expression matching that structure
-4. The original will have the same operands but a different operator
+Text-based matching (`a + b` as string) is fragile:
+- `a+b` and `a + b` are different strings but same code
+- Comments or formatting break matches
+- May match in wrong locations
 
-This means the user only needs to specify what they want, not what they're replacing.
+AST-based matching compares syntax structure:
+- `a + b` parses to `ExprBinary { left: "a", op: Add, right: "b" }`
+- Whitespace and formatting are ignored
+- Matches the actual code structure
 
 ---
 
@@ -102,46 +107,50 @@ settings:
   timeout: 30  # seconds per test run
 
 mutations:
-  # Simple, readable format
+  # Arithmetic mutations
   - file: src/calculator.rs
     function: add
-    description: Replace addition with subtraction
-    replace_with: a - b
+    original: a + b
+    replacement: a - b
 
   - file: src/calculator.rs
     function: add
-    description: Replace addition with multiplication
-    replace_with: a * b
+    original: a + b
+    replacement: a * b
 
-  - file: src/calculator.rs
-    function: divide
-    description: Return zero instead of computing
-    replace_with: "0.0"
+  # Comparison mutations
+  - file: src/validator.rs
+    function: check_bounds
+    original: x >= min
+    replacement: x > min
 
+  - file: src/validator.rs
+    function: check_bounds
+    original: x <= max
+    replacement: x < max
+
+  # Logical mutations
   - file: src/validator.rs
     function: is_valid
-    description: Change AND to OR in validation
-    replace_with: is_active || has_permission
+    original: is_active && has_permission
+    replacement: is_active || has_permission
 
-  - file: src/validator.rs
-    function: check_bounds
-    description: Off-by-one error in lower bound
-    replace_with: x > min   # was x >= min
-
-  - file: src/validator.rs
-    function: check_bounds
-    description: Off-by-one error in upper bound
-    replace_with: x < max   # was x <= max
+  # Return value mutations
+  - file: src/auth.rs
+    function: authenticate
+    original: password == stored_hash
+    replacement: "true"
 
   - file: src/auth.rs
     function: authenticate
-    description: Always return authentication failure
-    replace_with: "false"
+    original: password == stored_hash
+    replacement: "false"
 
-  - file: src/auth.rs
-    function: authenticate
-    description: Skip password check
-    replace_with: "true"
+  # Literal mutations
+  - file: src/config.rs
+    function: default_timeout
+    original: "30"
+    replacement: "0"
 ```
 
 ### Configuration Fields
@@ -149,162 +158,127 @@ mutations:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `file` | Yes | Path to the Rust source file |
-| `function` | Yes | Name of the function to mutate |
-| `description` | Yes | Human-readable description of the mutation |
-| `replace_with` | Yes | The replacement code (what it should become) |
+| `function` | Yes | Name of the function containing the code |
+| `original` | Yes | The code to find (parsed as AST) |
+| `replacement` | Yes | The code to replace it with |
 | `id` | No | Optional unique identifier (auto-generated if omitted) |
 
 ### Why This Format Works
 
-1. **Intuitive**: Write what you want the code to become
-2. **No duplication**: Don't need to specify both original and replacement
-3. **Self-documenting**: The description explains the intent
-4. **Flexible**: Works for any expression type
+1. **Clear intent**: See exactly what changes from what
+2. **Human-readable**: No need to understand AST internals
+3. **Flexible**: Works for any valid Rust expression
+4. **Explicit**: No ambiguity about what gets replaced
 
 ---
 
 ## Mutation Matching Algorithm
 
-### Step 1: Parse the Replacement
+### Step 1: Parse Original and Replacement
 
 ```rust
-/// Parse the replacement code into an AST expression
-fn parse_replacement(code: &str) -> Result<syn::Expr, ParseError> {
-    syn::parse_str::<syn::Expr>(code)
-        .map_err(|e| ParseError::InvalidReplacement {
-            code: code.to_string(),
+/// Parse both original and replacement code into AST expressions
+fn parse_mutation(mutation: &MutationConfig) -> Result<ParsedMutation, ParseError> {
+    let original = syn::parse_str::<syn::Expr>(&mutation.original)
+        .map_err(|e| ParseError::InvalidOriginal {
+            code: mutation.original.clone(),
             error: e.to_string(),
-        })
+        })?;
+
+    let replacement = syn::parse_str::<syn::Expr>(&mutation.replacement)
+        .map_err(|e| ParseError::InvalidReplacement {
+            code: mutation.replacement.clone(),
+            error: e.to_string(),
+        })?;
+
+    Ok(ParsedMutation { original, replacement })
 }
 ```
 
-### Step 2: Determine What to Search For
-
-The replacement expression tells us what structure to match:
+### Step 2: Search for Original in Function
 
 ```rust
-/// Determine what original expression pattern to search for
-fn infer_search_pattern(replacement: &syn::Expr) -> SearchPattern {
-    match replacement {
-        // Binary expression: look for same operands, any operator
-        syn::Expr::Binary(bin) => SearchPattern::BinaryExpr {
-            left: extract_pattern(&bin.left),
-            right: extract_pattern(&bin.right),
-            exclude_op: Some(bin.op.clone()),  // Don't match if already this op
-        },
-
-        // Literal: look for same type of literal
-        syn::Expr::Lit(lit) => SearchPattern::Literal {
-            kind: literal_kind(&lit.lit),
-            exclude_value: Some(lit.lit.clone()),
-        },
-
-        // Unary expression: look for same operand
-        syn::Expr::Unary(unary) => SearchPattern::UnaryExpr {
-            operand: extract_pattern(&unary.expr),
-            exclude_op: Some(unary.op.clone()),
-        },
-
-        // Path/identifier: look for same identifier with different value
-        syn::Expr::Path(path) => SearchPattern::Identifier {
-            name: path_to_string(path),
-        },
-
-        // Method call: look for same receiver and method
-        syn::Expr::MethodCall(call) => SearchPattern::MethodCall {
-            receiver: extract_pattern(&call.receiver),
-            method: call.method.to_string(),
-        },
-
-        // Default: exact structural match excluding the replacement itself
-        _ => SearchPattern::Structural {
-            pattern: replacement.clone(),
-        },
-    }
-}
-```
-
-### Step 3: Search Within Function
-
-```rust
-/// Find matching expressions within a function
-struct ExpressionFinder {
-    pattern: SearchPattern,
+/// Find the original expression within the target function
+struct ExpressionMatcher {
+    target: syn::Expr,        // The AST to find
     function_name: String,
     matches: Vec<MatchedSite>,
+    in_target_function: bool,
 }
 
-impl<'ast> Visit<'ast> for ExpressionFinder {
+impl<'ast> Visit<'ast> for ExpressionMatcher {
     fn visit_item_fn(&mut self, func: &'ast syn::ItemFn) {
-        if func.sig.ident.to_string() == self.function_name {
-            // Only search within this function
+        if func.sig.ident == self.function_name {
+            self.in_target_function = true;
             syn::visit::visit_item_fn(self, func);
+            self.in_target_function = false;
         }
-        // Don't recurse into other functions
     }
 
-    fn visit_expr_binary(&mut self, expr: &'ast syn::ExprBinary) {
-        if let SearchPattern::BinaryExpr { left, right, exclude_op } = &self.pattern {
-            if matches_pattern(&expr.left, left)
-               && matches_pattern(&expr.right, right)
-               && !matches_op(&expr.op, exclude_op)
-            {
-                self.matches.push(MatchedSite {
-                    original_expr: syn::Expr::Binary(expr.clone()),
-                    span: expr.span(),
-                });
-            }
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if self.in_target_function && ast_equals(expr, &self.target) {
+            self.matches.push(MatchedSite {
+                span: get_span(expr),
+                line: get_line(expr),
+            });
         }
-        // Continue visiting children
-        syn::visit::visit_expr_binary(self, expr);
+        // Continue searching in child expressions
+        syn::visit::visit_expr(self, expr);
     }
+}
 
-    fn visit_expr_lit(&mut self, expr: &'ast syn::ExprLit) {
-        if let SearchPattern::Literal { kind, exclude_value } = &self.pattern {
-            if matches_literal_kind(&expr.lit, kind)
-               && !matches_literal_value(&expr.lit, exclude_value)
-            {
-                self.matches.push(MatchedSite {
-                    original_expr: syn::Expr::Lit(expr.clone()),
-                    span: expr.span(),
-                });
-            }
+/// Compare two AST expressions for structural equality
+fn ast_equals(a: &syn::Expr, b: &syn::Expr) -> bool {
+    // Compare structure, ignoring spans/whitespace
+    match (a, b) {
+        (syn::Expr::Binary(a), syn::Expr::Binary(b)) => {
+            ast_equals(&a.left, &b.left)
+                && binop_equals(&a.op, &b.op)
+                && ast_equals(&a.right, &b.right)
         }
-        syn::visit::visit_expr_lit(self, expr);
+        (syn::Expr::Lit(a), syn::Expr::Lit(b)) => {
+            lit_equals(&a.lit, &b.lit)
+        }
+        (syn::Expr::Path(a), syn::Expr::Path(b)) => {
+            path_equals(&a.path, &b.path)
+        }
+        // ... handle other expression types
+        _ => false,
     }
-
-    // ... similar for other expression types
 }
 ```
 
-### Step 4: Handle Match Results
+### Step 3: Handle Match Results
 
 ```rust
-/// Process the search results
-fn process_matches(
+fn find_mutation_target(
+    ast: &syn::File,
     mutation: &MutationConfig,
-    matches: Vec<MatchedSite>,
-) -> Result<MutationTarget, MutationError> {
-    match matches.len() {
+    parsed: &ParsedMutation,
+) -> Result<MatchedSite, MutationError> {
+    let mut matcher = ExpressionMatcher {
+        target: parsed.original.clone(),
+        function_name: mutation.function.clone(),
+        matches: Vec::new(),
+        in_target_function: false,
+    };
+
+    matcher.visit_file(ast);
+
+    match matcher.matches.len() {
         0 => Err(MutationError::NoMatch {
-            mutation_id: mutation.id.clone(),
-            function: mutation.function.clone(),
             file: mutation.file.clone(),
-            replacement: mutation.replace_with.clone(),
-            hint: suggest_fix(&mutation),
+            function: mutation.function.clone(),
+            original: mutation.original.clone(),
         }),
 
-        1 => Ok(MutationTarget {
-            site: matches.into_iter().next().unwrap(),
-            replacement: mutation.parsed_replacement.clone(),
-        }),
+        1 => Ok(matcher.matches.remove(0)),
 
         n => Err(MutationError::AmbiguousMatch {
-            mutation_id: mutation.id.clone(),
             function: mutation.function.clone(),
+            original: mutation.original.clone(),
             match_count: n,
-            locations: matches.iter().map(|m| m.span).collect(),
-            hint: "Add more context to the replacement to disambiguate".to_string(),
+            locations: matcher.matches,
         }),
     }
 }
@@ -319,256 +293,163 @@ fn process_matches(
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum MutationError {
-    /// Replacement code couldn't be parsed as valid Rust
-    #[error("Invalid replacement code")]
-    InvalidReplacement {
-        mutation_id: String,
+    /// Original code couldn't be parsed as valid Rust
+    #[error("Invalid original expression: {code}")]
+    InvalidOriginal {
         code: String,
         parse_error: String,
     },
 
-    /// Target file doesn't exist or can't be read
-    #[error("Cannot read source file")]
-    FileNotFound {
-        file: PathBuf,
-        io_error: String,
+    /// Replacement code couldn't be parsed as valid Rust
+    #[error("Invalid replacement expression: {code}")]
+    InvalidReplacement {
+        code: String,
+        parse_error: String,
     },
 
-    /// Target file contains invalid Rust syntax
-    #[error("Cannot parse source file")]
-    InvalidSourceFile {
+    /// Target file doesn't exist
+    #[error("File not found: {file}")]
+    FileNotFound {
         file: PathBuf,
-        parse_error: String,
     },
 
     /// Target function not found in file
     #[error("Function '{function}' not found in {file}")]
     FunctionNotFound {
-        mutation_id: String,
         file: PathBuf,
         function: String,
         available_functions: Vec<String>,
     },
 
-    /// No matching expression found in function
-    #[error("No matching expression found")]
+    /// Original expression not found in function
+    #[error("Expression '{original}' not found in function '{function}'")]
     NoMatch {
-        mutation_id: String,
         file: PathBuf,
         function: String,
-        replacement: String,
-        hint: String,
+        original: String,
     },
 
-    /// Multiple matching expressions found (ambiguous)
-    #[error("Ambiguous match: found {match_count} possible locations")]
+    /// Multiple matches found (ambiguous)
+    #[error("Found {match_count} matches for '{original}' in '{function}'")]
     AmbiguousMatch {
-        mutation_id: String,
         function: String,
+        original: String,
         match_count: usize,
-        locations: Vec<Span>,
-        hint: String,
-    },
-
-    /// Mutation would create invalid syntax
-    #[error("Mutation would create invalid code")]
-    InvalidMutation {
-        mutation_id: String,
-        reason: String,
+        locations: Vec<MatchedSite>,
     },
 }
 ```
 
 ### User-Friendly Error Messages
 
-```rust
-impl MutationError {
-    pub fn display_error(&self) -> String {
-        match self {
-            MutationError::FunctionNotFound {
-                mutation_id, file, function, available_functions
-            } => {
-                let mut msg = format!(
-                    "Error in mutation '{}':\n\
-                     Function '{}' not found in {}\n\n",
-                    mutation_id, function, file.display()
-                );
+```
+Error: Expression 'a + b' not found in function 'add'
+  --> src/calculator.rs
 
-                if !available_functions.is_empty() {
-                    msg.push_str("Available functions in this file:\n");
-                    for f in available_functions {
-                        msg.push_str(&format!("  - {}\n", f));
-                    }
-                }
-                msg
-            }
+  The function 'add' does not contain the expression 'a + b'.
 
-            MutationError::NoMatch {
-                mutation_id, file, function, replacement, hint
-            } => {
-                format!(
-                    "Error in mutation '{}':\n\
-                     No matching expression found for '{}'\n\
-                     in function '{}' at {}\n\n\
-                     Hint: {}\n",
-                    mutation_id, replacement, function, file.display(), hint
-                )
-            }
+  Check that:
+    - Variable names match exactly (a, b vs x, y)
+    - The expression exists in this function
+    - Whitespace doesn't matter, but structure does
 
-            MutationError::AmbiguousMatch {
-                mutation_id, function, match_count, locations, hint
-            } => {
-                let mut msg = format!(
-                    "Error in mutation '{}':\n\
-                     Found {} matching expressions in function '{}':\n\n",
-                    mutation_id, match_count, function
-                );
-
-                for (i, loc) in locations.iter().enumerate() {
-                    msg.push_str(&format!(
-                        "  {}. Line {}, column {}\n",
-                        i + 1, loc.start().line, loc.start().column
-                    ));
-                }
-
-                msg.push_str(&format!("\nHint: {}\n", hint));
-                msg
-            }
-
-            // ... other error types
-            _ => format!("{}", self),
-        }
-    }
-}
+  Available expressions in 'add':
+    - x + y  (line 5)
+    - result * 2  (line 6)
 ```
 
-### Helpful Hints
+```
+Error: Found 2 matches for 'a + b' in function 'calculate'
+  --> src/math.rs
 
-```rust
-/// Generate helpful hints when a mutation doesn't match
-fn suggest_fix(mutation: &MutationConfig) -> String {
-    let replacement = &mutation.replace_with;
+  The expression 'a + b' appears multiple times:
+    1. Line 10, column 12
+    2. Line 15, column 8
 
-    // Check if it looks like a binary expression
-    if let Ok(expr) = syn::parse_str::<syn::Expr>(replacement) {
-        match expr {
-            syn::Expr::Binary(bin) => {
-                let left = quote::quote!(#bin.left).to_string();
-                let right = quote::quote!(#bin.right).to_string();
-                format!(
-                    "Looking for a binary expression with '{}' and '{}'.\n\
-                     Check that these variable names match exactly in the function.\n\
-                     Try: grep for '{}' and '{}' in the function body.",
-                    left, right, left, right
-                )
-            }
-            syn::Expr::Lit(_) => {
-                "Looking for a literal value of the same type.\n\
-                 Check that the function contains a literal that could be replaced."
-                    .to_string()
-            }
-            _ => {
-                "Check that the expression structure exists in the function.\n\
-                 Variable names must match exactly."
-                    .to_string()
-            }
-        }
-    } else {
-        format!(
-            "The replacement '{}' may not be valid Rust syntax.\n\
-             Try parsing it separately to check for errors.",
-            replacement
-        )
-    }
-}
+  To fix: Make the original expression more specific,
+  or split into separate mutations for each location.
 ```
 
-### Validation at Load Time
+```
+Error: Function 'subtract' not found in src/calculator.rs
+
+  Available functions in this file:
+    - add
+    - multiply
+    - divide
+```
+
+### Validation Before Running
 
 ```rust
-/// Validate all mutations before running tests
-pub fn validate_config(config: &Config) -> ValidationReport {
-    let mut report = ValidationReport::new();
+/// Validate all mutations before running any tests
+pub fn validate_config(config: &Config) -> Result<(), Vec<MutationError>> {
+    let mut errors = Vec::new();
 
     for mutation in &config.mutations {
         // 1. Check file exists
         if !mutation.file.exists() {
-            report.add_error(ValidationError::FileNotFound {
-                mutation_id: mutation.id.clone(),
+            errors.push(MutationError::FileNotFound {
                 file: mutation.file.clone(),
             });
             continue;
         }
 
-        // 2. Parse replacement code
-        let parsed_replacement = match syn::parse_str::<syn::Expr>(&mutation.replace_with) {
-            Ok(expr) => expr,
-            Err(e) => {
-                report.add_error(ValidationError::InvalidReplacement {
-                    mutation_id: mutation.id.clone(),
-                    code: mutation.replace_with.clone(),
-                    error: e.to_string(),
-                });
-                continue;
-            }
-        };
+        // 2. Parse original expression
+        if let Err(e) = syn::parse_str::<syn::Expr>(&mutation.original) {
+            errors.push(MutationError::InvalidOriginal {
+                code: mutation.original.clone(),
+                parse_error: e.to_string(),
+            });
+            continue;
+        }
 
-        // 3. Parse source file
-        let source = match std::fs::read_to_string(&mutation.file) {
-            Ok(s) => s,
-            Err(e) => {
-                report.add_error(ValidationError::FileReadError {
-                    mutation_id: mutation.id.clone(),
-                    file: mutation.file.clone(),
-                    error: e.to_string(),
-                });
-                continue;
-            }
-        };
+        // 3. Parse replacement expression
+        if let Err(e) = syn::parse_str::<syn::Expr>(&mutation.replacement) {
+            errors.push(MutationError::InvalidReplacement {
+                code: mutation.replacement.clone(),
+                parse_error: e.to_string(),
+            });
+            continue;
+        }
 
-        let ast = match syn::parse_file(&source) {
-            Ok(f) => f,
-            Err(e) => {
-                report.add_error(ValidationError::ParseError {
-                    mutation_id: mutation.id.clone(),
-                    file: mutation.file.clone(),
-                    error: e.to_string(),
-                });
-                continue;
-            }
-        };
+        // 4. Parse source file and find function
+        let source = std::fs::read_to_string(&mutation.file)?;
+        let ast = syn::parse_file(&source)?;
 
-        // 4. Find function
         let functions = collect_function_names(&ast);
         if !functions.contains(&mutation.function) {
-            report.add_error(ValidationError::FunctionNotFound {
-                mutation_id: mutation.id.clone(),
+            errors.push(MutationError::FunctionNotFound {
                 file: mutation.file.clone(),
                 function: mutation.function.clone(),
-                available: functions,
+                available_functions: functions,
             });
             continue;
         }
 
-        // 5. Find matching expression
-        let pattern = infer_search_pattern(&parsed_replacement);
-        let matches = find_matches(&ast, &mutation.function, &pattern);
-
+        // 5. Find the original expression in the function
+        let matches = find_expression(&ast, &mutation.function, &mutation.original);
         match matches.len() {
-            0 => report.add_error(ValidationError::NoMatch {
-                mutation_id: mutation.id.clone(),
+            0 => errors.push(MutationError::NoMatch {
+                file: mutation.file.clone(),
                 function: mutation.function.clone(),
-                replacement: mutation.replace_with.clone(),
+                original: mutation.original.clone(),
             }),
-            1 => report.add_valid(mutation.id.clone()),
-            n => report.add_warning(ValidationWarning::AmbiguousMatch {
-                mutation_id: mutation.id.clone(),
+            1 => {} // OK
+            n => errors.push(MutationError::AmbiguousMatch {
+                function: mutation.function.clone(),
+                original: mutation.original.clone(),
                 match_count: n,
+                locations: matches,
             }),
         }
     }
 
-    report
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 ```
 
@@ -647,8 +528,8 @@ pub struct Settings {
 pub struct MutationConfig {
     pub file: PathBuf,
     pub function: String,
-    pub description: String,
-    pub replace_with: String,
+    pub original: String,
+    pub replacement: String,
     #[serde(default = "generate_id")]
     pub id: String,
 }
@@ -665,57 +546,51 @@ impl Config {
 ### Matcher (`src/matcher.rs`)
 
 ```rust
-use syn::{Expr, ExprBinary, visit::Visit};
+use syn::{Expr, visit::Visit};
 
-/// Pattern describing what to search for
-pub enum SearchPattern {
-    /// Binary expression with specific operands
-    BinaryExpr {
-        left: OperandPattern,
-        right: OperandPattern,
-        exclude_op: Option<syn::BinOp>,
-    },
-    /// Literal of specific type
-    Literal {
-        kind: LiteralKind,
-        exclude_value: Option<syn::Lit>,
-    },
-    /// Unary expression
-    UnaryExpr {
-        operand: OperandPattern,
-        exclude_op: Option<syn::UnOp>,
-    },
-    /// Any structural match
-    Structural {
-        pattern: Expr,
-    },
-}
-
-/// Pattern for matching operands
-pub enum OperandPattern {
-    /// Exact identifier match
-    Ident(String),
-    /// Any expression
-    Any,
-    /// Nested pattern
-    Nested(Box<SearchPattern>),
-}
-
-/// Find all matching expressions in a function
-pub fn find_matches(
+/// Find all occurrences of an expression within a function
+pub fn find_expression(
     ast: &syn::File,
     function_name: &str,
-    pattern: &SearchPattern,
+    original: &str,
 ) -> Vec<MatchedSite> {
-    let mut finder = ExpressionFinder {
-        pattern: pattern.clone(),
+    // Parse the original expression
+    let target: syn::Expr = syn::parse_str(original)
+        .expect("original should be pre-validated");
+
+    let mut matcher = ExpressionMatcher {
+        target,
         function_name: function_name.to_string(),
         matches: Vec::new(),
         in_target_function: false,
     };
 
-    finder.visit_file(ast);
-    finder.matches
+    matcher.visit_file(ast);
+    matcher.matches
+}
+
+struct ExpressionMatcher {
+    target: syn::Expr,
+    function_name: String,
+    matches: Vec<MatchedSite>,
+    in_target_function: bool,
+}
+
+impl<'ast> Visit<'ast> for ExpressionMatcher {
+    fn visit_item_fn(&mut self, func: &'ast syn::ItemFn) {
+        if func.sig.ident == self.function_name {
+            self.in_target_function = true;
+            syn::visit::visit_item_fn(self, func);
+            self.in_target_function = false;
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if self.in_target_function && ast_equals(expr, &self.target) {
+            self.matches.push(MatchedSite::from_expr(expr));
+        }
+        syn::visit::visit_expr(self, expr);
+    }
 }
 ```
 
@@ -773,27 +648,25 @@ impl Mutator {
 ### Code Generator (`src/codegen.rs`)
 
 ```rust
-use quote::ToTokens;
-
 /// Generate source code from AST
 pub fn generate_source(ast: &syn::File) -> String {
     prettyplease::unparse(ast)
 }
 
 /// Apply mutation and generate mutated source
-pub fn generate_mutant(
-    original_source: &str,
+pub fn apply_mutation(
+    source: &str,
     mutation: &MutationConfig,
 ) -> Result<String, MutationError> {
-    // Parse original
-    let mut ast = syn::parse_file(original_source)?;
+    // Parse the source file
+    let mut ast = syn::parse_file(source)?;
 
-    // Parse replacement
-    let replacement = syn::parse_str::<syn::Expr>(&mutation.replace_with)?;
+    // Parse original and replacement expressions
+    let original_expr: syn::Expr = syn::parse_str(&mutation.original)?;
+    let replacement_expr: syn::Expr = syn::parse_str(&mutation.replacement)?;
 
-    // Find match
-    let pattern = infer_search_pattern(&replacement);
-    let matches = find_matches(&ast, &mutation.function, &pattern);
+    // Find the original expression in the function
+    let matches = find_expression(&ast, &mutation.function, &mutation.original);
 
     let target = match matches.len() {
         0 => return Err(MutationError::NoMatch { /* ... */ }),
@@ -801,10 +674,10 @@ pub fn generate_mutant(
         n => return Err(MutationError::AmbiguousMatch { /* ... */ }),
     };
 
-    // Apply mutation
-    Mutator::apply(&mut ast, target, &replacement)?;
+    // Apply the mutation
+    Mutator::apply(&mut ast, target, &replacement_expr)?;
 
-    // Generate source
+    // Generate the mutated source
     Ok(generate_source(&ast))
 }
 ```
@@ -942,8 +815,8 @@ impl MutationReport {
 ```yaml
 - file: src/math.rs
   function: add
-  description: Replace addition with subtraction
-  replace_with: a - b
+  original: a + b
+  replacement: a - b
 ```
 
 **Source file (`src/math.rs`):**
@@ -954,11 +827,12 @@ pub fn add(a: i32, b: i32) -> i32 {
 ```
 
 **How it works:**
-1. Parse `a - b` → `ExprBinary { left: "a", op: Sub, right: "b" }`
-2. Infer pattern: binary expr with left="a", right="b", op != Sub
-3. Search `add` function → find `a + b`
-4. Replace with `a - b`
-5. Run tests
+1. Parse `a + b` as AST → `ExprBinary { left: "a", op: Add, right: "b" }`
+2. Parse source file into AST
+3. Find function `add` in AST
+4. Search for expression matching `a + b`
+5. Replace with `a - b`
+6. Run tests
 
 **Generated mutant:**
 ```rust
@@ -973,8 +847,8 @@ pub fn add(a: i32, b: i32) -> i32 {
 ```yaml
 - file: src/validator.rs
   function: is_adult
-  description: Change >= to > (off-by-one)
-  replace_with: age > 18
+  original: age >= 18
+  replacement: age > 18
 ```
 
 **Source:**
@@ -984,10 +858,7 @@ pub fn is_adult(age: u32) -> bool {
 }
 ```
 
-**Matching:**
-- Pattern: binary expr, left="age", right="18", op != Gt
-- Finds: `age >= 18`
-- Replaces with: `age > 18`
+**Result:** Tests boundary condition - does the test catch off-by-one?
 
 ### Example 3: Literal Mutation
 
@@ -995,8 +866,8 @@ pub fn is_adult(age: u32) -> bool {
 ```yaml
 - file: src/config.rs
   function: default_timeout
-  description: Return zero instead of default
-  replace_with: "0"
+  original: "30"
+  replacement: "0"
 ```
 
 **Source:**
@@ -1006,10 +877,7 @@ pub fn default_timeout() -> u64 {
 }
 ```
 
-**Matching:**
-- Pattern: integer literal, value != 0
-- Finds: `30`
-- Replaces with: `0`
+**Result:** Tests if code handles zero timeout correctly.
 
 ### Example 4: Error Case - No Match
 
@@ -1017,19 +885,19 @@ pub fn default_timeout() -> u64 {
 ```yaml
 - file: src/math.rs
   function: add
-  description: This won't match
-  replace_with: x - y
+  original: x + y
+  replacement: x - y
 ```
 
 **Error output:**
 ```
-Error in mutation 'add_1':
-No matching expression found for 'x - y'
-in function 'add' at src/math.rs
+Error: Expression 'x + y' not found in function 'add'
+  --> src/math.rs
 
-Hint: Looking for a binary expression with 'x' and 'y'.
-Check that these variable names match exactly in the function.
-The function uses variables 'a' and 'b', not 'x' and 'y'.
+  The function 'add' does not contain 'x + y'.
+
+  Check that variable names match exactly.
+  The function uses: a, b (not x, y)
 ```
 
 ### Example 5: Error Case - Ambiguous Match
@@ -1038,8 +906,8 @@ The function uses variables 'a' and 'b', not 'x' and 'y'.
 ```yaml
 - file: src/math.rs
   function: complex
-  description: Change addition
-  replace_with: a - b
+  original: a + b
+  replacement: a - b
 ```
 
 **Source:**
@@ -1053,14 +921,13 @@ pub fn complex(a: i32, b: i32) -> i32 {
 
 **Error output:**
 ```
-Error in mutation 'complex_1':
-Found 2 matching expressions in function 'complex':
+Error: Found 2 matches for 'a + b' in function 'complex'
+  --> src/math.rs
 
   1. Line 2, column 15
   2. Line 3, column 17
 
-Hint: Add more context to the replacement to disambiguate,
-or split into separate mutations targeting each location.
+  To fix: Use a more specific expression that only matches once.
 ```
 
 ---
@@ -1132,10 +999,17 @@ mutation-testing-rust/
 
 This specification defines a **manual mutation testing framework** where:
 
-1. **Users specify mutations** in a simple YAML format with just the replacement code
-2. **The engine infers** what original expression to find based on the replacement structure
-3. **AST-based matching** provides precise, whitespace-insensitive matching
-4. **Clear error messages** help users fix configuration issues
-5. **Validation happens upfront** before any tests run
+1. **Users specify mutations** with explicit `original` and `replacement` expressions
+2. **AST-based matching** finds the original expression regardless of whitespace/formatting
+3. **Clear error messages** explain exactly what went wrong and how to fix it
+4. **Validation happens upfront** before any tests run
 
-The approach prioritizes **human readability** and **clear error handling** over automatic discovery, making it easier to maintain and debug mutation configurations.
+**Config format:**
+```yaml
+- file: src/math.rs
+  function: add
+  original: a + b
+  replacement: a - b
+```
+
+The approach prioritizes **clarity** and **predictability** - you see exactly what will change.
